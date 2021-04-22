@@ -1,0 +1,732 @@
+---
+title: "Movielens Report"
+author: "Chul Hee Kim"
+date: '2021 4 21 '
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+### End of Creating Data Sets ###
+### Beginning of Creating Algorithm ###
+
+# Split 'edx set' into training and test sets
+set.seed(1, sample.kind="Rounding")
+y <- edx$rating
+test_index <- createDataPartition(y, times = 1, p = 0.2, list = FALSE)
+train_set <- edx[-test_index]
+test_set <- edx[test_index]
+
+# Remove entries in test set for those not included in training set
+test_set <- test_set %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+# Separate genres in training and test sets for 'genre effect' modeling
+train_set_separated <- train_set %>%
+  separate_rows(genres, sep = "\\|")
+
+test_set_separated <- test_set %>%
+  separate_rows(genres, sep = "\\|")
+
+# Define RMSE (Root Mean Squared Error) function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+# Movie (M) Effects
+mu_hat <- mean(train_set$rating) # This mu_hat is repeatedly used throughout this code
+movie_avgs <- train_set %>%      # Contains movie to movie biases, b_i
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu_hat))
+
+bi_plot <- qplot(b_i, data = movie_avgs, bins = 20, color = I("black")) # plot showing b_i's vary substantially
+
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  mutate(pred = mu_hat + b_i) %>%
+  .$pred
+M <- RMSE(test_set$rating, predicted_ratings) #> 0.94374
+
+# Movie + User (MU) Effects
+movie_user_avgs <- train_set %>%  # Contains user biases, b_u
+  left_join(movie_avgs, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu_hat - b_i))
+
+bu_plot <- qplot(b_u, data = movie_user_avgs, bins = 30, color = I("black")) # plot showing b_u's vary substantially
+
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  mutate(pred = mu_hat + b_i + b_u) %>%
+  .$pred
+MU <- RMSE(test_set$rating, predicted_ratings) #> 0.86593
+
+# Movie + User + Genre (MUG) Effects
+genre_avgs <- train_set_separated %>%  # Contains genre biases, b_g
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu_hat - b_i - b_u))
+
+bg_plot <- qplot(b_g, data = genre_avgs, bins = 30, color = I("black")) # plot showing b_g's vary substantially
+
+predicted_ratings <- test_set_separated %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  left_join(genre_avgs, by = "genres") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g) %>%
+  .$pred
+
+MUG <- RMSE(test_set_separated$rating, predicted_ratings) #> 0.86419
+
+# Movie + User + Genre + Time (MUGT) Effects
+
+  # Check if there is any evidence of time effect
+date_plot <- edx %>% 
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(date) %>% 
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(date, rating)) +
+  geom_point() +
+  geom_smooth() #> plot shows there is some evidence, but not significant
+
+  # Convert timestamp column into date and round it to weekly basis
+train_set_date <- train_set_separated %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week"))
+
+test_set_date <- test_set_separated %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week"))
+
+time_avgs <- train_set_date %>%  # Contains time biases, b_t
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  left_join(genre_avgs, by = "genres") %>%
+  group_by(date) %>%
+  summarize(b_t = mean(rating - mu_hat - b_i - b_u - b_g))
+
+predicted_ratings <- test_set_date %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  left_join(genre_avgs, by = "genres") %>%
+  left_join(time_avgs, by = "date") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g + b_t) %>%
+  .$pred
+
+MUGT <- RMSE(test_set_separated$rating, predicted_ratings) #> 0.86408
+
+# Why We Need Regularized Model
+movie_titles <- edx %>%  # For use below
+  select(movieId, title) %>%
+  distinct()
+
+top10 <- train_set %>% 
+  count(movieId) %>%  # Showing # of ratings for movies having top 10 large positive b_i's
+  left_join(movie_avgs, by="movieId") %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  slice(1:10) %>% 
+  pull(n) #> [1] 1 1 2 1 1 1 1 3 4 2
+
+worst10 <- train_set %>% 
+  count(movieId) %>%  # Showing # of ratings for movies having top 10 large negative b_i's
+  left_join(movie_avgs, by="movieId") %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  slice(1:10) %>% 
+  pull(n) #> [1] 2 1 1 1 30 40 161 10 2 1
+
+# Regularized Movie + User (RMU) Effects
+
+lambdas <- seq(0, 10, 0.25) # Use cross-validation to choose optimal lambda
+
+rmses <- sapply(lambdas, function(d){
+  
+  mu_hat <- mean(train_set$rating)
+  
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu_hat) / (n() + d))
+  
+  b_u <- train_set %>%
+    left_join(b_i, by = "movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu_hat - b_i) / (n() + d))
+  
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu_hat + b_i + b_u) %>%
+    .$pred
+  
+  return(RMSE(test_set$rating, predicted_ratings))
+})
+
+qplot(lambdas, rmses) 
+lambda <- lambdas[which.min(rmses)] #> 4.75
+RMU <- rmses[which.min(rmses)] #> 0.86524
+
+# Regularized Movie + User + Genre (RMUG) Effects
+
+lambda <- 4.75 # Verified it by using cross-validation but skipped it here
+               # because it just takes too long to run the code
+
+b_i <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat) / (n() + lambda))
+  
+b_u <- train_set %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i) / (n() + lambda))
+  
+b_g <- train_set_separated %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u) / (n() + lambda))
+  
+predicted_ratings <- test_set_separated %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g) %>%
+  .$pred
+  
+RMUG <- RMSE(test_set_separated$rating, predicted_ratings) #> 0.86355
+
+# Regularized Movie + User + Genre + Time (RMUGT) Effects
+
+lambda <- 5 # Verified it by using cross-validation but skipped it here
+            # because it just takes too long to run the code
+
+b_i <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat) / (n() + lambda))
+
+b_u <- train_set %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i) / (n() + lambda))
+
+b_g <- train_set_separated %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u) / (n() + lambda))
+
+b_t <- train_set_date %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(date) %>%
+  summarize(b_t = sum(rating - mu_hat - b_i - b_u - b_g) / (n() + lambda))
+
+predicted_ratings <- test_set_date %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_t, by = "date") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g + b_t) %>%
+  .$pred
+  
+RMUGT <- RMSE(test_set_separated$rating, predicted_ratings) #> 0.86339 (Lowest RMSE!)
+
+# Comparison of all RMSE's (Bar Plot)
+names <- c("MU", "MUG", "MUGT", "RMU", "RMUG", "RMUGT")
+rmses <- round(c(MU, MUG, MUGT, RMU, RMUG, RMUGT), 5)
+df <- as_tibble(cbind(names, rmses))
+comparison <- df %>% 
+  ggplot(aes(names, rmses, fill=ifelse(names=="RMUGT","A","B"))) +
+  geom_col(show.legend=FALSE) +
+  scale_fill_manual(values = c(A="firebrick3", B="steelblue4")) +
+  labs(title = "RMSE's of All Models", x = "", y = "") +
+  theme(plot.title = element_text(hjust = 0.4))
+
+######################################################################
+# Choose "Regularized Movie + User + Genre + Time Effects" Model
+# Train the final model with edx data and test it on validation set
+######################################################################
+
+# edx set preparation
+edx_separated <- edx %>%
+  separate_rows(genres, sep = "\\|")
+
+edx_date <- edx_separated %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week"))
+
+validation_separated <- validation %>%
+  separate_rows(genres, sep = "\\|") %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week"))
+
+lambda <- 5 
+
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat) / (n() + lambda))
+
+b_u <- edx %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i) / (n() + lambda))
+
+b_g <- edx_separated %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u) / (n() + lambda))
+
+b_t <- edx_date %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(date) %>%
+  summarize(b_t = sum(rating - mu_hat - b_i - b_u - b_g) / (n() + lambda))
+
+predicted_ratings <- validation_separated %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_t, by = "date") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g + b_t) %>%
+  .$pred
+
+RMSE(validation_separated$rating, predicted_ratings) #> 0.86249
+```
+
+## Overview
+
+This project is designed to build a machine learning algorithm for a movie recommendation system.
+We will use the _Movielens_ dataset provided by [Grouplens](https://www.grouplens.org/datasets/movielens/10m), 
+which includes about 10 million ratings along with user, movie, and date information.
+
+_Movielens_ has 10,000,054 observations in rows and six variables in columns: 
+userId, movieId, rating, timestamp, title, and genre.
+Our goal is to find an algorithm that predicts ratings based on these variables.
+We will only use the linear regression model in this project and add biases in the model 
+to make a better prediction. Root Mean Squared Error (RMSE) will be used to confirm the best model.
+
+
+## Analysis
+
+##### - Data Preparation  
+
+
+**movielens** will be downloaded and separated into **edx** set (90%) and **validation** set (10%).
+**It is very important to note that the validation set is only for the final test!** It should not be used during 
+training and testing process in the middle of building an algorithm. **edx** set is what we use for training and testing,
+and only after we find the final model, the **validation** set will be used for the final test.
+
+##### - Glimpse of Movielens
+
+```{r table1, echo = FALSE, results = 'asis'}
+knitr::kable(edx[1:5,], caption = "First five rows of Movielens")
+```
+Notable features  
+
+  * 69,878 users
+  * 10,677 movies
+  * **timestamp** is not in an intuitive format. It will be modified in normal date format.
+  * Each observation has one or more **genres**, which is problematic when used to train an algorithm. It will be modified to having one genre per row.
+  * **movieId** and **title** gives us the same information. Only **movieId** will be considered in modeling.
+
+```{r table2, echo = FALSE, results = 'asis'}
+knitr::kable(edx_date[1:5,], caption = "Modified version of Movielens")
+```
+  * The new dataset has a new column, **date**.
+  * **genres** column now has only one genre per row.
+  * However, because genres are separated, the dataset now has about 2.5 times more rows than the original _Movielens_,
+  which makes the code running longer. Therefore, the original set is used for models that do not include genres and date.
+  
+##### - Modeling Approach (Part 1)  
+
+
+Throughout the modeling process, Root Mean Squared Error (RMSE) will be used to assess how closely a model
+estimated the ratings to the actual observations. RMSE is basically the average of the differences between 
+each prediction and observation. The lower the RMSE, the better. 
+
+**edx** dataset is now separated into **train_set** and **test_set**. We will train multiple models using 
+the **train_set** and make predictions for each model using variables in the **test_set**. Lastly, RMSE is
+calculated by finding the mean differences between the predictions and the ratings in the **test_set**. 
+
+
+**1. Movie (M) Model**
+
+Let's start with the movie factor. Some movies are generally rated higher than others. 
+To see it visually, we can group the dataset by **movieId** and find the differences (**b_i**) between each rating
+and "average of all ratings" (**mu_hat**) in the **train_set**.
+
+```{r bi_plot, echo=FALSE}
+bi_plot
+```
+  
+This plot shows that there is significant movie-to-movie variation. In other words, **b_i** explains this 
+variation and helps us make predictions. By adding **b_i** to **test_set**, we get our predictions
+for this first model by calculating **mu_hat + b_i**.
+
+```{r M, eval=FALSE}
+mu_hat <- mean(train_set$rating) 
+movie_avgs <- train_set %>%      
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu_hat))
+
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  mutate(pred = mu_hat + b_i) %>%
+  .$pred
+M <- RMSE(test_set$rating, predicted_ratings) 
+```
+RMSE for the 'M' model is 0.94374. Let's see if we can lower this by adding other factors.
+
+
+**2. Movie + User (MU) Model**
+
+We now take into consideration that some users generally give high ratings and some are opposite. Following 
+similar approaches taken in 'M' model, we group the **train_set** by **userId** and find the differences (**b_u**)
+between each rating and **mu_hat - b_i**.
+
+```{r bu_plot, echo=FALSE}
+bu_plot
+```
+  
+This plot shows that there is significant user-to-user variation. **b_u** explains this 
+variation and helps us make predictions. By adding **b_u** to **test_set**, we get our predictions
+for 'MU' model by calculating **mu_hat + b_i + b_u**.
+
+```{r MU, eval=FALSE}
+movie_user_avgs <- train_set %>%  
+  left_join(movie_avgs, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu_hat - b_i))
+
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  mutate(pred = mu_hat + b_i + b_u) %>%
+  .$pred
+MU <- RMSE(test_set$rating, predicted_ratings) 
+```
+RMSE for 'MU' model is 0.86593, which is significant improvement from the previous model. 
+Let's now add **genres** to our model.
+
+
+**3. Movie + User + Genre (MUG) Model**
+
+Similarly, we now group by **genres** and find the differences (**b_g**)
+between each rating and **mu_hat - b_i - b_u**.
+
+  * This is when we have to modify our dataset and separate genres as explained in Table 2.
+
+```{r bg_plot, echo=FALSE}
+bg_plot
+```
+This plot shows that there is some, but not much genre-to-genre variation. Let's check if our model makes 
+improvement regardless. By adding **b_g** to **test_set**, we get our predictions
+for 'MUG' model by calculating **mu_hat + b_i + b_u + b_g**.
+
+```{r MUG, eval=FALSE}
+genre_avgs <- train_set_separated %>% 
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu_hat - b_i - b_u))
+
+predicted_ratings <- test_set_separated %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  left_join(genre_avgs, by = "genres") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g) %>%
+  .$pred
+
+MUG <- RMSE(test_set_separated$rating, predicted_ratings) 
+```
+RMSE is now 0.86419. As expected, we only have minor improvement from the 'MU' model.
+
+
+**4. Movie + User + Genre + Time (MUGT) Model**
+
+We now group by **date** and find the differences (**b_t**)
+between each rating and **mu_hat - b_i - b_u - b_g**.
+
+  * This is when we have to modify timestamp in the dataset as explained in Table 2.
+
+```{r date_plot, echo=FALSE}
+date_plot
+```
+This plot shows that there is some, but not very strong trend. Let's check if our model makes 
+improvement regardless. By adding **b_t** to **test_set**, we get our predictions
+for 'MUGT' model by calculating **mu_hat + b_i + b_u + b_g + b_t**.
+
+```{r MUGT, eval=FALSE}
+time_avgs <- train_set_date %>%  
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  left_join(genre_avgs, by = "genres") %>%
+  group_by(date) %>%
+  summarize(b_t = mean(rating - mu_hat - b_i - b_u - b_g))
+
+predicted_ratings <- test_set_date %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(movie_user_avgs, by = "userId") %>%
+  left_join(genre_avgs, by = "genres") %>%
+  left_join(time_avgs, by = "date") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g + b_t) %>%
+  .$pred
+
+MUGT <- RMSE(test_set_separated$rating, predicted_ratings) 
+```
+RMSE is now 0.86408. Again as expected, we only have minor improvement from the 'MUG' model.
+
+##### - Modeling Approach (Part 2)  
+
+
+We now introduce _Regularization_.
+
+```{r table3, echo = FALSE, results = 'asis'}
+tbl <- rbind(top10, worst10)
+colnames(tbl) <- c("n1","n2","n3","n4","n5","n6","n7","n8","n9","n10")
+knitr::kable(tbl, caption = "Number of ratings given for top and worst rated movies")
+```
+This table shows that most of these top and worst movies have too small sample sizes. These are untrustworthy and
+can potentially increase uncertainty in our models, so we need to make some adjustments. Rather than removing
+all observations with small samples, we penalize them by regularization. We won't go into details here, but simply
+speaking, the movies with small samples get penalized by adding a term called **lambda**, which has almost no effect
+when added to ones with large samples.
+
+
+**1. Regularized Movie + User (RMU) Model**
+
+Before we take similar approaches as we did in the previous models, regularization requires us to find 
+the optimal lambda. Cross-validation enables us to find which lambda minimizes RMSE. We inspect lambdas between
+0 and 10, incremented by 0.25. General process is the same as 'MU' model, but now we now average residuals by
+**N + lambda**, rather than just **N**.
+
+```{r RMU, eval=FALSE}
+lambdas <- seq(0, 10, 0.25) 
+
+rmses <- sapply(lambdas, function(d){
+  
+  mu_hat <- mean(train_set$rating)
+  
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu_hat) / (n() + d))
+  
+  b_u <- train_set %>%
+    left_join(b_i, by = "movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu_hat - b_i) / (n() + d))
+  
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu_hat + b_i + b_u) %>%
+    .$pred
+  
+  return(RMSE(test_set$rating, predicted_ratings))
+})
+
+lambda <- lambdas[which.min(rmses)] 
+RMU <- rmses[which.min(rmses)] 
+```
+RMSE is 0.86524 with lambda of 4.75. 'RMU' model made some improvement from 'MU' model.
+
+
+**2. Regularized Movie + User + Genre (RMUG) Model**
+
+General approach is the same as 'MUG' model but is regularized. We do not show the cross-validation below, but
+the lambda was actually derived by cross-validating. 
+
+```{r RMUG, eval=FALSE}
+lambda <- 4.75 
+
+b_i <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat) / (n() + lambda))
+  
+b_u <- train_set %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i) / (n() + lambda))
+  
+b_g <- train_set_separated %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u) / (n() + lambda))
+  
+predicted_ratings <- test_set_separated %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g) %>%
+  .$pred
+  
+RMUG <- RMSE(test_set_separated$rating, predicted_ratings) 
+```
+RMSE is 0.86355, and 'RMUG' has slight improvement over 'MUG' model.
+
+
+**3. Regularized Movie + User + Genre + Time (RMUGT) Model**
+
+Again, approach is sames as 'MUGT' model but is regularized. We again do not show the cross-validation below, but
+the lambda was actually derived by cross-validating. 
+
+```{r RMUGT, eval=FALSE}
+lambda <- 5 
+
+b_i <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat) / (n() + lambda))
+
+b_u <- train_set %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i) / (n() + lambda))
+
+b_g <- train_set_separated %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u) / (n() + lambda))
+
+b_t <- train_set_date %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(date) %>%
+  summarize(b_t = sum(rating - mu_hat - b_i - b_u - b_g) / (n() + lambda))
+
+predicted_ratings <- test_set_date %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_t, by = "date") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g + b_t) %>%
+  .$pred
+  
+RMUGT <- RMSE(test_set_separated$rating, predicted_ratings) 
+```
+RMSE is 0.86339, the lowest of all models!
+
+## Results  
+
+The plot shown below summarizes all RMSE's from models we have developed.
+
+```{r comparison, echo=FALSE}
+comparison
+```
+  
+It is fairly obvious to choose 'RMUGT' model, which is the last one we developed
+as it generates the lowest RMSE.
+
+
+Now, it is time to use the **validation** set to test our algorithm. But, before that, 
+we need to train our 'RMUGT' model on the entire **edx** set because so far, we have trained
+our models on a part of **edx** set. Although not shown here, we should modify **timestamp** and **genres** 
+column in the **edx** and **validation** set as we did in Table 2.
+
+```{r validation, eval=FALSE}
+lambda <- 5 
+
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat) / (n() + lambda))
+
+b_u <- edx %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i) / (n() + lambda))
+
+b_g <- edx_separated %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u) / (n() + lambda))
+
+b_t <- edx_date %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(date) %>%
+  summarize(b_t = sum(rating - mu_hat - b_i - b_u - b_g) / (n() + lambda))
+
+predicted_ratings <- validation_separated %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_t, by = "date") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g + b_t) %>%
+  .$pred
+
+RMSE(validation_separated$rating, predicted_ratings) #> 0.86249
+
+```
+The final RMSE using 'RMUGT' model on the **validation** set is 0.86249.
+
+
+## Conclusion
+
+Although we were able to reduce the RMSE with each addition of new variable or regularization, please
+be reminded that our final result is based only on linear regression model. Also, when we incorporated the
+time effect, we grouped the date by week, but it might render a better result when grouped by month or by year.
+
+
+In terms of efficiency of the modeling process, there were frequent instances that we had to modify the dataset
+and make already large set even larger, resulting in a much longer processing time when running the code. 
+This was the case especially with incorporating **genre** effect, and we could work on finding more efficient 
+ways to cleaning the dataset.
+
+
+In conclusion, the 'Regularized Movie + User + Genre + Time' (RMUGT) model is what this project derived as
+the final algorithm for movie recommendation system. Though all four variables are taken into consideration
+for this model, it is evident that movie and user effect is much greater and related than genre and time effect. 
